@@ -258,6 +258,90 @@ amqp_socket_get_sockfd(amqp_socket_t *self)
   return self->klass->get_sockfd(self);
 }
 
+ssize_t amqp_try_writev(amqp_connection_state_t state, struct iovec *iov,
+                        int iovcnt) {
+  int i;
+  ssize_t res;
+  struct iovec *iov_left = iov;
+  int iovcnt_left = iovcnt;
+  ssize_t len_left;
+
+  len_left = 0;
+  for (i = 0; i < iovcnt_left; ++i) {
+    len_left += iov_left[i].iov_len;
+  }
+
+  res = amqp_socket_writev(state->socket, iov_left, iovcnt_left);
+
+  if (res > 0) {
+  }
+  return res;
+}
+
+ssize_t amqp_try_send(amqp_connection_state_t state, const void *buf,
+                      size_t len) {
+  ssize_t res;
+  void* buf_left = (void*)buf;
+  /* Assume that len is going to be larger than ssize_t can hold. */
+  ssize_t len_left = (size_t)len;
+  struct timeval *timeout = NULL;
+  int fd = amqp_get_sockfd(state);
+
+  if (-1 == fd) {
+    return AMQP_STATUS_SOCKET_CLOSED;
+  }
+
+start_send:
+  res = amqp_socket_send(state->socket, buf_left, len_left);
+
+  if (res > 0) {
+    len_left -= res;
+    buf_left = (char*)buf_left - res;
+    if (0 == len_left) {
+      return AMQP_STATUS_OK;
+    }
+    goto start_send;
+  } else if (res != AMQP_PRIVATE_STATUS_SOCKET_NEEDWRITE) {
+    return res;
+  }
+  {
+    struct pollfd pfd;
+    int timeout_ms;
+
+start_poll:
+    pfd.fd = fd;
+    /* TODO: wait for POLLIN too? */
+    pfd.events = POLLOUT;
+
+    if (timeout) {
+      timeout_ms =
+          timeout->tv_sec * AMQP_MS_PER_S + timeout->tv_usec / AMQP_US_PER_MS;
+    } else {
+      timeout_ms = -1;
+    }
+
+    res = poll(&pfd, 1, timeout_ms);
+
+    if (0 < res) {
+      goto start_send;
+    } else if (0 == res) {
+      /* TODO deal with timeout */
+      return AMQP_STATUS_TIMEOUT;
+    } else {
+      switch (amqp_os_socket_error()) {
+        case EINTR:
+          if (timeout) {
+            /* TODO: recalcuate timeout */
+          }
+          goto start_poll;
+        default:
+          return AMQP_STATUS_SOCKET_ERROR;
+      }
+    }
+  }
+  return res;
+}
+
 int
 amqp_open_socket(char const *hostname,
                  int portnumber)
@@ -431,7 +515,7 @@ int amqp_send_header(amqp_connection_state_t state)
                                      AMQP_PROTOCOL_VERSION_MINOR,
                                      AMQP_PROTOCOL_VERSION_REVISION
                                    };
-  return amqp_socket_send(state->socket, header, sizeof(header));
+  return amqp_try_send(state, header, sizeof(header));
 }
 
 static amqp_bytes_t sasl_method_name(amqp_sasl_method_enum method)
@@ -629,7 +713,7 @@ start_recv:
         } else if (0 == res) {
           return AMQP_STATUS_TIMEOUT;
         } else if (-1 == res) {
-          switch (errno) {
+          switch (amqp_os_socket_error()) {
             case EINTR:
               if (timeout) {
                 uint64_t end_timestamp;
